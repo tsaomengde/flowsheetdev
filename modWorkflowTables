@@ -1,0 +1,548 @@
+Option Explicit
+
+' =========================
+' Configuration
+' =========================
+Private Const PHONE_TABLE_NAME As String = "PhoneTable"
+
+' Column display names (exact header captions in the ListObject)
+Private Const COL_PHONE_NUMBER As String = "Phone Number"
+Private Const COL_CONTACT_TYPE As String = "Contact Type"
+Private Const COL_CONTACT_NAME As String = "Contact Name"
+Private Const COL_PHONE_TYPE  As String = "Phone Type"
+
+' =========================
+' Module state
+' =========================
+Private mTxnActive As Boolean
+Private mInsertedRow As ListRow
+Private mInsertedSheet As Worksheet
+Private mInWorkflow As Boolean
+
+' Dedicated launcher instance (avoid default instance pitfalls)
+Private mLauncher As UF_Launcher
+
+' Menu picker state (to reuse UF_WFMenu as a generic 2-option picker)
+Private Enum WFMenuMode
+    mmNone = 0
+    mmMenu = 1
+    mmPickContactType = 2
+    mmPickContactName = 3
+    mmPickPhoneType = 4
+End Enum
+
+Private mMenuMode As WFMenuMode
+Private mMenuResult As String
+
+' =========================
+' LAUNCHER (modeless) helpersmod
+' =========================
+
+' Show the modeless launcher (one instance), honoring exclusions, and position bottom-right.
+Public Sub ShowLauncher()
+    On Error GoTo Fail
+
+    Dim ws As Worksheet
+    If TypeOf Application.ActiveSheet Is Worksheet Then
+        Set ws = Application.ActiveSheet
+    Else
+        ' Not a worksheet surface (e.g., chart sheet) => hide if present and bail
+        HideLauncher False
+        Exit Sub
+    End If
+
+    ' Exclude certain sheets
+    If IsExcludedSheet(ws) Then
+        HideLauncher False
+        Exit Sub
+    End If
+
+    ' Ensure instance exists
+    If Not LauncherExists() Then
+        Set mLauncher = New UF_Launcher
+        mLauncher.StartUpPosition = 0
+    End If
+
+    ' Show if hidden
+    If Not mLauncher.Visible Then
+        mLauncher.Show vbModeless
+    End If
+
+    ' Sync and position
+    SyncLauncherToSheet ws
+    PositionLauncherBottomRight
+    ' Reposition again shortly to avoid left/top glitches during initial paint
+    On Error Resume Next
+    Application.OnTime Now + TimeValue("00:00:01"), "modWorkflowTables.PositionLauncherBottomRight"
+    On Error GoTo 0
+    Exit Sub
+
+Fail:
+    MsgBox "Unable to show launcher: " & Err.Description, vbCritical
+End Sub
+
+' Hide (or unload) the launcher
+Public Sub HideLauncher(Optional ByVal doUnload As Boolean = False)
+    On Error Resume Next
+    If LauncherExists() Then
+        If doUnload Then
+            unload mLauncher
+            Set mLauncher = Nothing
+        Else
+            mLauncher.Hide
+        End If
+    End If
+End Sub
+
+' Public so we can invoke via Application.OnTime
+Public Sub PositionLauncherBottomRight()
+    On Error GoTo CleanExit
+    If Not LauncherExists() Then Exit Sub
+
+    Dim marginRight As Double, marginBottom As Double
+    marginRight = 30
+    marginBottom = 80  ' leave room for status bar/taskbar
+
+    With mLauncher
+        .StartUpPosition = 0
+        Dim L As Double, T As Double
+        L = Application.Left + Application.Width - .Width - marginRight
+        T = Application.Top + Application.Height - .Height - marginBottom
+
+        If L < 0 Then L = 0
+        If T < 0 Then T = 0
+
+        .Left = L
+        .Top = T
+    End With
+
+CleanExit:
+    ' no-op
+End Sub
+
+' Update the launcher text/state to match the given sheet
+Public Sub SyncLauncherToSheet(ByVal Sh As Object)
+    On Error GoTo CleanExit
+
+    If Not (TypeOf Sh Is Worksheet) Then
+        HideLauncher False
+        Exit Sub
+    End If
+
+    Dim ws As Worksheet
+    Set ws = Sh
+
+    ' Honor exclusions
+    If IsExcludedSheet(ws) Then
+        HideLauncher False
+        Exit Sub
+    End If
+
+    ' Ensure it exists/visible if called directly
+    If Not LauncherExists() Then
+        ShowLauncher
+        Exit Sub
+    End If
+
+    With mLauncher
+        .lblTitle.caption = "Launcher – " & ws.Name
+
+        Dim hasPhoneTable As Boolean
+        hasPhoneTable = Not (GetPhoneTable(ws) Is Nothing)
+
+        .cmdAddPhone.Enabled = hasPhoneTable
+        If hasPhoneTable Then
+            .lblStatus.caption = "Ready: '" & PHONE_TABLE_NAME & "' found on this sheet."
+        Else
+            .lblStatus.caption = "This sheet does not contain '" & PHONE_TABLE_NAME & "'."
+        End If
+    End With
+
+    ' Keep position stable
+    PositionLauncherBottomRight
+
+CleanExit:
+    ' no-op
+End Sub
+
+' True if launcher object exists and is in a good state
+Private Function LauncherExists() As Boolean
+    On Error GoTo Nope
+    LauncherExists = Not (mLauncher Is Nothing)
+    If LauncherExists Then
+        ' Touch a member to ensure it's not an invalid/unloaded reference
+        Dim tmp As Boolean
+        tmp = mLauncher.Visible
+    End If
+    Exit Function
+Nope:
+    Set mLauncher = Nothing
+    LauncherExists = False
+End Function
+
+' Sheet exclusion logic (case-insensitive exact names)
+Private Function IsExcludedSheet(ByVal ws As Worksheet) As Boolean
+    Dim nm As String
+    nm = LCase$(ws.Name)
+    IsExcludedSheet = (nm = "backend" Or nm = "master")
+End Function
+
+' Called by the launcher button to start the workflow immediately
+Public Sub StartAddPhone_FromLauncher()
+    StartWorkflow_PhoneTable
+End Sub
+
+' =========================
+' Public entry points (menu & picker)
+' =========================
+
+' Shows the modal workflow menu form (UF_WFMenu) in "menu" mode (original behavior).
+' The form should have two buttons: cmdA and cmdB.
+Public Sub ShowWorkflowMenu()
+    If mInWorkflow Then
+        MsgBox "A workflow is already active. Please finish or cancel it first.", vbExclamation
+        Exit Sub
+    End If
+
+    On Error GoTo CleanFail
+    mInWorkflow = True
+    mMenuMode = mmMenu
+    mMenuResult = vbNullString
+
+    Load UF_WFMenu
+    UF_WFMenu.caption = "Workflow Menu"
+    UF_WFMenu.Show vbModal
+
+CleanExit:
+    mInWorkflow = False
+    mMenuMode = mmNone
+    Exit Sub
+
+CleanFail:
+    MsgBox "Unable to open workflow menu: " & Err.Description, vbCritical
+    Resume CleanExit
+End Sub
+
+' Reuse UF_WFMenu as a 2-option picker; returns Variant:
+'   - Selected button's Caption (String) on success
+'   - Boolean False if the dialog was canceled/closed
+Private Function PickFromWFMenu(ByVal mode As WFMenuMode, ByVal title As String) As Variant
+    On Error GoTo Fail
+
+    mMenuMode = mode
+    mMenuResult = vbNullString
+
+    Load UF_WFMenu
+    UF_WFMenu.caption = title
+    UF_WFMenu.Show vbModal
+
+    If Len(mMenuResult) > 0 Then
+        PickFromWFMenu = mMenuResult
+    Else
+        PickFromWFMenu = False  ' canceled
+    End If
+
+CleanExit:
+    mMenuMode = mmNone
+    Exit Function
+
+Fail:
+    PickFromWFMenu = False
+    Resume CleanExit
+End Function
+
+' Button handlers called from UF_WFMenu
+Public Sub WFMenu_OptionA()
+    On Error Resume Next
+
+    Select Case mMenuMode
+        Case mmMenu
+            ' Original menu behavior: Option A runs the PhoneTable workflow
+            StartWorkflow_PhoneTable
+            unload UF_WFMenu
+
+        Case mmPickContactType, mmPickContactName, mmPickPhoneType
+            ' Picker mode: return the button's Caption
+            mMenuResult = UF_WFMenu.cmdA.caption
+            unload UF_WFMenu
+
+        Case Else
+            unload UF_WFMenu
+    End Select
+End Sub
+
+Public Sub WFMenu_OptionB()
+    On Error Resume Next
+
+    Select Case mMenuMode
+        Case mmMenu
+            ' Original menu behavior: placeholder
+            MsgBox "Option B is a placeholder.", vbInformation
+            unload UF_WFMenu
+
+        Case mmPickContactType, mmPickContactName, mmPickPhoneType
+            ' Picker mode: return the button's Caption
+            mMenuResult = UF_WFMenu.cmdB.caption
+            unload UF_WFMenu
+
+        Case Else
+            unload UF_WFMenu
+    End Select
+End Sub
+
+' Optional helper for a cancel/close button on the menu (if you add one).
+Public Sub WFMenu_CloseMenu()
+    On Error Resume Next
+    unload UF_WFMenu
+End Sub
+
+' =========================
+' Core PhoneTable workflow
+' =========================
+' Implements:
+' 1) Append a row at the bottom of the table (first real row if empty)
+' 2) Prompt for: Phone Number -> (WFMenu pickers) Contact Type -> Contact Name -> Phone Type
+' 3) Commit on success; Roll back (delete appended row) on cancel at any step
+' Notes are excluded by design.
+Public Sub StartWorkflow_PhoneTable()
+    Dim lo As ListObject
+    Dim lr As ListRow
+    Dim v As Variant
+
+    On Error GoTo Fail
+
+    Set lo = GetPhoneTable()   ' sheet-aware (defaults to ActiveSheet)
+    If lo Is Nothing Then
+        MsgBox "Table '" & PHONE_TABLE_NAME & "' was not found on the active sheet.", vbCritical
+        Exit Sub
+    End If
+
+    ' Begin transactional append at the bottom
+    Set lr = BeginBottomRowTransaction(lo)
+    If lr Is Nothing Then
+        MsgBox "Could not add a new row.", vbCritical
+        Exit Sub
+    End If
+
+    ' === Step 1: Phone Number ===
+    v = Application.InputBox( _
+            prompt:="Enter Phone Number:", _
+            title:="PhoneTable Workflow – Step 1 of 4", _
+            Type:=2)
+    If IsCanceled(v) Then GoTo RollbackAndExit
+    Dim phoneValue As String
+    phoneValue = Trim$(CStr(v))
+    If Len(phoneValue) = 0 Then
+        MsgBox "Phone Number is required.", vbExclamation
+        GoTo RollbackAndExit
+    End If
+
+    ' Normalize/format phone number and write as TEXT
+    Dim formattedPhone As String
+    formattedPhone = FormatPhoneNumber(phoneValue)
+    WriteCell lr, COL_PHONE_NUMBER, formattedPhone, True  ' True = force text format
+
+    ' === Step 2: Contact Type (via UF_WFMenu picker) ===
+    v = PickFromWFMenu(mmPickContactType, "Select Contact Type")
+    If IsCanceled(v) Then GoTo RollbackAndExit
+    WriteCell lr, COL_CONTACT_TYPE, CStr(v)
+
+    ' === Step 3: Contact Name (via UF_WFMenu picker) ===
+    v = PickFromWFMenu(mmPickContactName, "Select Contact Name")
+    If IsCanceled(v) Then GoTo RollbackAndExit
+    WriteCell lr, COL_CONTACT_NAME, CStr(v)
+
+    ' === Step 4: Phone Type (via UF_WFMenu picker) ===
+    v = PickFromWFMenu(mmPickPhoneType, "Select Phone Type")
+    If IsCanceled(v) Then GoTo RollbackAndExit
+    WriteCell lr, COL_PHONE_TYPE, CStr(v)
+
+    ' === Commit ===
+    CommitTransaction True
+    SelectRow lr
+    MsgBox "PhoneTable entry added.", vbInformation
+    Exit Sub
+
+RollbackAndExit:
+    RollbackTransaction
+    Exit Sub
+
+Fail:
+    ' Any unexpected error: roll back if needed
+    Dim msg As String
+    msg = "An error occurred: " & Err.Description
+    RollbackTransaction
+    MsgBox msg, vbCritical
+End Sub
+
+' =========================
+' Transaction helpers
+' =========================
+' Appends a new row at the bottom and marks the transaction active.
+Private Function BeginBottomRowTransaction(ByVal lo As ListObject) As ListRow
+    On Error GoTo Fail
+
+    If mTxnActive Then
+        ' A previous transaction is still active; cleanly roll it back.
+        RollbackTransaction
+    End If
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    Dim lr As ListRow
+    ' Append at bottom (default behavior). This will use the first data row if the table is empty.
+    Set lr = lo.ListRows.Add
+
+    Set mInsertedRow = lr
+    Set mInsertedSheet = lo.Parent
+    mTxnActive = True
+
+    Set BeginBottomRowTransaction = lr
+
+CleanExit:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Function
+
+Fail:
+    Set BeginBottomRowTransaction = Nothing
+    Resume CleanExit
+End Function
+
+' Commit the transaction: just clears state; keep the inserted row.
+Private Sub CommitTransaction(ByVal selectInserted As Boolean)
+    On Error Resume Next
+    If mTxnActive Then
+        If selectInserted And Not mInsertedRow Is Nothing Then
+            SelectRow mInsertedRow
+        End If
+    End If
+    ClearTxnState
+End Sub
+
+' Roll back the transaction: delete the inserted row if present.
+Public Sub RollbackTransaction()
+    On Error Resume Next
+    If mTxnActive Then
+        If Not mInsertedRow Is Nothing Then
+            mInsertedRow.Delete
+        End If
+    End If
+    ClearTxnState
+End Sub
+
+Private Sub ClearTxnState()
+    On Error Resume Next
+    Set mInsertedRow = Nothing
+    Set mInsertedSheet = Nothing
+    mTxnActive = False
+End Sub
+
+' =========================
+' Table / column helpers (SHEET-AWARE)
+' =========================
+
+' Returns the PhoneTable ListObject on the specified sheet.
+' If ws is omitted, uses the ActiveSheet (worksheet only).
+Public Function GetPhoneTable(Optional ByVal ws As Worksheet) As ListObject
+    Dim lo As ListObject
+
+    If ws Is Nothing Then
+        If Not (TypeOf Application.ActiveSheet Is Worksheet) Then
+            Set GetPhoneTable = Nothing
+            Exit Function
+        End If
+        Set ws = Application.ActiveSheet
+    End If
+
+    For Each lo In ws.ListObjects
+        If StrComp(lo.Name, PHONE_TABLE_NAME, vbTextCompare) = 0 Then
+            Set GetPhoneTable = lo
+            Exit Function
+        End If
+    Next lo
+
+    Set GetPhoneTable = Nothing
+End Function
+
+' Writes text to a column by header name in the given ListRow.
+' If forceText=True, sets the cell's NumberFormat to Text ("@") before writing.
+Private Sub WriteCell(ByVal lr As ListRow, ByVal header As String, ByVal textVal As String, Optional ByVal forceText As Boolean = False)
+    Dim lo As ListObject
+    Set lo = lr.Parent
+
+    Dim idx As Long
+    idx = ColumnIndexByHeader(lo, header)
+    If idx = 0 Then
+        Err.Raise vbObjectError + 513, "WriteCell", _
+                  "Column '" & header & "' not found in table '" & lo.Name & "'."
+    End If
+
+    Dim target As Range
+    Set target = lr.Range.Cells(1, idx)
+
+    If forceText Then target.NumberFormat = "@"
+    target.Value = textVal
+End Sub
+
+' Finds the 1-based column index (within the ListObject data body range) by header text.
+Private Function ColumnIndexByHeader(ByVal lo As ListObject, ByVal header As String) As Long
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(lo.ListColumns(i).Name, header, vbTextCompare) = 0 Then
+            ColumnIndexByHeader = i
+            Exit Function
+        End If
+    Next i
+    ColumnIndexByHeader = 0
+End Function
+
+' Selects the entire ListRow to give the user visual feedback.
+Private Sub SelectRow(ByVal lr As ListRow)
+    On Error Resume Next
+    lr.Range.Worksheet.Activate
+    lr.Range.Select
+End Sub
+
+' Detects if an Application.InputBox or picker was canceled.
+Private Function IsCanceled(ByVal v As Variant) As Boolean
+    ' Application.InputBox returns a Boolean False when canceled, regardless of Type
+    If VarType(v) = vbBoolean And v = False Then
+        IsCanceled = True
+    Else
+        IsCanceled = False
+    End If
+End Function
+
+' =========================
+' Phone number normalization
+' =========================
+
+' Formats a raw phone string as:
+'  - 10 digits: NNN-NNN-NNNN
+'  - 11 digits: (N)NNN-NNN-NNNN
+' Otherwise returns the original trimmed input.
+Private Function FormatPhoneNumber(ByVal raw As String) As String
+    Dim i As Long, ch As String, digits As String
+    raw = Trim$(raw)
+
+    ' Extract digits only
+    For i = 1 To Len(raw)
+        ch = Mid$(raw, i, 1)
+        If ch >= "0" And ch <= "9" Then digits = digits & ch
+    Next i
+
+    Select Case Len(digits)
+        Case 10
+            ' AAA-BBB-CCCC
+            FormatPhoneNumber = Left$(digits, 3) & "-" & Mid$(digits, 4, 3) & "-" & Right$(digits, 4)
+        Case 11
+            ' (C)AAA-BBB-CCCC
+            FormatPhoneNumber = "(" & Left$(digits, 1) & ")" & Mid$(digits, 2, 3) & "-" & Mid$(digits, 5, 3) & "-" & Right$(digits, 4)
+        Case Else
+            ' Leave as-is if not 10 or 11 digits
+            FormatPhoneNumber = raw
+    End Select
+End Function
+
